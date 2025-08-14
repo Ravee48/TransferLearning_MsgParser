@@ -1,5 +1,6 @@
 import os
 from typing import Any, Dict, List, Tuple
+from contextlib import asynccontextmanager
 
 import torch
 from fastapi import Body, FastAPI, HTTPException
@@ -7,7 +8,7 @@ from pydantic import BaseModel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
-app = FastAPI(title="Transaction Message Classifier", version="1.0.0")
+ 
 
 # Load environment variables from a local .env file if present
 try:
@@ -22,6 +23,14 @@ tokenizer: AutoTokenizer | None = None
 model: AutoModelForSequenceClassification | None = None
 device = torch.device("cpu")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global tokenizer, model
+    if tokenizer is None or model is None:
+        tokenizer, model = load_model_and_tokenizer()
+    yield
+
+app = FastAPI(title="Transaction Message Classifier", version="1.0.0", lifespan=lifespan)
 
 def resolve_model_dir() -> str:
     env_path = os.environ.get("MODEL_DIR")
@@ -87,11 +96,7 @@ class PredictionOut(BaseModel):
     result: str
 
 
-@app.on_event("startup")
-def _startup_load_once() -> None:
-    global tokenizer, model
-    if tokenizer is None or model is None:
-        tokenizer, model = load_model_and_tokenizer()
+ 
 
 
 @app.get("/")
