@@ -1,0 +1,9 @@
+data/
+venv_TL/
+test.ipynb
+__pycache__/
+.DS_Store
+train.ipynb
+model_V01
+.env
+model_V01.zip
