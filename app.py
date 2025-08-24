@@ -1,122 +1,138 @@
-
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from typing import List, Tuple, Dict
-import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-from pydantic import BaseModel
+# app.py  — ONNX Runtime + Tokenizers-only FastAPI server
 import os
+import numpy as np
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import onnxruntime as ort
+from tokenizers import Tokenizer
+import asyncio
+
+# ---------------- Config (env-overridable) ----------------
+ONNX_PATH = os.getenv("ONNX_PATH", "./onnx_export/model.int8.onnx")
+TOKENIZER_DIR = os.getenv("TOKENIZER_DIR", "./tokenizer")
+TOKENIZER_JSON = os.getenv("TOKENIZER_JSON", f"{TOKENIZER_DIR}/tokenizer.json")
+MAX_LEN = int(os.getenv("MAX_LEN", "128"))          # 96–128 is a sweet spot for speed
+NUM_THREADS = int(os.getenv("NUM_THREADS", "4"))    # 1–2 on small boxes
+BATCH_LIMIT = int(os.getenv("BATCH_LIMIT", "1024")) # safety upper bound
+# For large batches, allow more threads for ONNX and numpy
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["OMP_NUM_THREADS"] = str(NUM_THREADS)
+os.environ["MKL_NUM_THREADS"] = str(NUM_THREADS)
+
+print(f"Number of threads set for ONNX and numpy: {NUM_THREADS}")
+
+# ---------------- App ----------------
+app = FastAPI(title="ONNX Text Classifier", version="1.0")
+
+# ---------------- Load tokenizer (HF tokenizers) ----------------
+try:
+    tok = Tokenizer.from_file(TOKENIZER_JSON)
+except Exception as e:
+    raise RuntimeError(f"Failed to load tokenizer at {TOKENIZER_JSON}: {e}")
+
+# enable CLS/SEP via post-processor already stored in tokenizer.json
+# padding/truncation
+pad_id = tok.token_to_id("[PAD]")
+if pad_id is None:
+    pad_id = 0  # many BERT-family tokenizers use 0 for [PAD]
+tok.enable_truncation(max_length=MAX_LEN)
+tok.enable_padding(length=MAX_LEN, pad_id=pad_id, pad_token="[PAD]")
+
+# ---------------- Load ONNX model ----------------
+so = ort.SessionOptions()
+so.intra_op_num_threads = NUM_THREADS
+so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+sess = ort.InferenceSession(ONNX_PATH, sess_options=so, providers=["CPUExecutionProvider"])
+
+# Discover optional inputs (e.g., token_type_ids)
+session_inputs = {i.name for i in sess.get_inputs()}  # {'input_ids','attention_mask',...}
 
 
-app = FastAPI()
+# ---------------- I/O schemas ----------------
+class PredictIn(BaseModel):
+    texts: List[str]                 # send up to 500 (or more) per call
+    prob_threshold: Optional[float] = None  # binary only; default 0.5
 
-# Define the path to the saved model and tokenizer
-MODEL_DIR = "./model"
-MAX_LEN = 128  # Define the maximum sequence length for padding
+class PredictWithIdsIn(BaseModel):
+    ids: List[str]
+    texts: List[str]
+    prob_threshold: Optional[float] = None
 
-# Determine the device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
+# New schema for msgs input
+class MsgItem(BaseModel):
+    id: str
+    message: str
 
-model = None
-tokenizer = None
+class MsgsIn(BaseModel):
+    msgs: List[MsgItem]
+    prob_threshold: Optional[float] = None
 
+# ---------------- Helpers ----------------
+def _prepare_batch(texts: List[str]):
+    if not isinstance(texts, list) or not texts:
+        raise HTTPException(status_code=400, detail="`texts` must be a non-empty list of strings.")
+    if len(texts) > BATCH_LIMIT:
+        raise HTTPException(status_code=413, detail=f"Batch too large (> {BATCH_LIMIT}).")
+    # Use numpy array allocation for speed
+    encs = tok.encode_batch([t if isinstance(t, str) else str(t) for t in texts])
+    input_ids = np.empty((len(encs), MAX_LEN), dtype=np.int64)
+    attention_mask = np.empty((len(encs), MAX_LEN), dtype=np.int64)
+    for i, e in enumerate(encs):
+        input_ids[i, :] = e.ids
+        attention_mask[i, :] = e.attention_mask
+    ort_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+    if "token_type_ids" in session_inputs:
+        ort_inputs["token_type_ids"] = np.zeros_like(input_ids, dtype=np.int64)
+    return ort_inputs
 
-class PredictionOut(BaseModel):
-    prediction: float
-    result: str
-
-
-def load_model_and_tokenizer():
-    global model, tokenizer
-    if model is None:
-        model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
-        model.to(device)
-        print("Model loaded successfully!")
-    if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-        print("Tokenizer loaded successfully!")
-
-
-
-def batch_predict(messages: List[str], max_length: int = 128) -> Tuple[List[int], List[float]]:
-    if tokenizer is None or model is None:
-        raise RuntimeError("Model not loaded")
-    inputs = tokenizer(
-        messages,
-        return_tensors="pt",
-        truncation=True,
-        padding=True,
-        max_length=max_length,
-    )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    with torch.no_grad():
-        logits = model(**inputs).logits
-        probs = torch.softmax(logits, dim=1)
-        preds = torch.argmax(probs, dim=1)
-        prob_tx = probs[:, 1]
-    return [int(p.item()) for p in preds], [float(s.item()) for s in prob_tx]
-
-
-
-def predict_messages_with_details(input_dict):
-    load_model_and_tokenizer()  # Load model and tokenizer if not already loaded
-    payload = input_dict
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Input payload must be a dictionary")
-    ids: List[str] = []
-    messages: List[str] = []
-    if "msgs" in payload:
-        msgs = payload.get("msgs")
-        if msgs is None:
-            return {}
-        if not isinstance(msgs, list):
-            raise HTTPException(status_code=400, detail="'msgs' must be a list of objects with 'id' and 'message'")
-        for item in msgs:
-            if not isinstance(item, dict):
-                raise HTTPException(status_code=400, detail="Each entry in 'msgs' must be an object")
-            if "id" not in item or "message" not in item:
-                raise HTTPException(status_code=400, detail="Each message must include 'id' and 'message'")
-            ids.append(str(item.get("id")))
-            messages.append(str(item.get("message", "")))
+def _postprocess_logits(logits: np.ndarray, prob_threshold: Optional[float]):
+    """
+    Works for binary (shape [N,1] or [N,2]) and multi-class (shape [N,C]).
+    Returns labels (ints) and probs (float or list of floats).
+    """
+    if logits.ndim != 2:
+        raise HTTPException(status_code=500, detail="Unexpected logits shape.")
+    N, C = logits.shape
+    # Binary with single logit
+    if C == 1:
+        probs = 1.0 / (1.0 + np.exp(-logits[:, 0]))
+        thr = 0.5 if prob_threshold is None else float(prob_threshold)
+        labels = (probs > thr).astype(int)
+        return labels.tolist(), probs.tolist()
+    # Multi-class (or binary with two logits)
+    shifted = logits - logits.max(axis=1, keepdims=True)
+    e = np.exp(shifted)
+    probs = e / e.sum(axis=1, keepdims=True)
+    labels = probs.argmax(axis=1)
+    # For binary C==2, return prob of class 1; for multi-class, return full distribution
+    if probs.shape[1] == 2:
+        return labels.tolist(), probs[:, 1].tolist()
     else:
-        # Back-compat: accept flat mapping {id: message}
-        if len(payload) == 0:
-            return {}
-        for k, v in payload.items():
-            ids.append(str(k))
-            messages.append(str(v) if v is not None else "")
-    if len(messages) == 0:
-        return {}
-    preds, scores = batch_predict(messages)
-    result: Dict[str, PredictionOut] = {}
-    for k, pred, score in zip(ids, preds, scores):
-        label = "Transactional" if pred == 1 else "Non-Transactional"
-        result[k] = PredictionOut(prediction=score, result=label)
+        return labels.tolist(), probs.tolist()
+
+
+# ---------------- Routes ----------------
+@app.get("/health")
+def health():
+    return {"status": "ok", "onnx": os.path.basename(ONNX_PATH), "max_len": MAX_LEN}
+
+# New endpoint for your input format
+@app.post("/predict")
+async def predict(inp: MsgsIn):
+    texts = [item.message for item in inp.msgs]
+    ids = [item.id for item in inp.msgs]
+    ort_inputs = _prepare_batch(texts)
+    loop = asyncio.get_event_loop()
+    logits = await loop.run_in_executor(None, lambda: sess.run(None, ort_inputs)[0])
+    labels, probs = _postprocess_logits(logits, inp.prob_threshold)
+    result = {}
+    for i, l, p in zip(ids, labels, probs):
+        label = "Transactional" if l == 1 else "Non-Transactional"
+        result[i] = {"prediction": float(p), "result": label}
     return result
 
-
-
-# Flask route removed. Only FastAPI is used.
-
-
-@app.post("/predict")
-async def predict(request: Request):
-    data = await request.json()
-    predictions = predict_messages_with_details(data)
-    predictions_dict = {k: v.dict() for k, v in predictions.items()}
-    return JSONResponse(content=predictions_dict)
-
-
-# ...existing code...
-
-
-
+# Uvicorn entrypoint
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", "8000")),
-        reload=False,
-    )
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)

@@ -8,7 +8,7 @@ model_V01
 .env
 model_V01.zip
 *.log
-# model
+model/
 venv_gpt/
 utils/
 venv
