@@ -9,3 +9,5 @@ model_V01
 model_V01.zip
 *.log
 model
+venv_gpt/
+utils/
